@@ -1,14 +1,25 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
-import { Download, Upload, Grid, Type, X, Settings, ChevronDown, ChevronUp, Sliders, Palette, Move } from 'lucide-react';
+import { Download, Upload, Grid, Type, X, Settings, ChevronDown, ChevronUp, Sliders, Palette, Move, Film, AlertCircle } from 'lucide-react';
 
 const Scii = () => {
   const [image, setImage] = useState(null);
+  const [video, setVideo] = useState(null);
   const [asciiArt, setAsciiArt] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [settingsExpanded, setSettingsExpanded] = useState(true);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordedChunks, setRecordedChunks] = useState([]);
+  const [videoLoaded, setVideoLoaded] = useState(false);
+  const [loadingStatus, setLoadingStatus] = useState('');
+  const [error, setError] = useState('');
   const fileInputRef = useRef(null);
   const canvasRef = useRef(null);
+  const videoRef = useRef(null);
+  const asciiCanvasRef = useRef(null);
   const asciiRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const animationRef = useRef(null);
   
   // ASCII parameters
   const [params, setParams] = useState({
@@ -20,7 +31,13 @@ const Scii = () => {
     invert: false,
     fontSize: 8,
     preserveTransparency: true,
-    alphaThreshold: 50
+    alphaThreshold: 50,
+    // Video-specific parameters
+    cropStart: 0,
+    cropEnd: 100,
+    videoWidth: 320,
+    videoHeight: 240,
+    fps: 30
   });
 
   const charsets = {
@@ -30,18 +47,66 @@ const Scii = () => {
     minimal: '█▄▀ '
   };
 
-  const handleImageUpload = useCallback((file) => {
-    if (!file || !file.type.startsWith('image/')) return;
+  const handleFileUpload = useCallback((file) => {
+    if (!file) return;
+    
+    const isVideo = file.type.startsWith('video/');
+    const isImage = file.type.startsWith('image/');
+    
+    if (!isImage && !isVideo) {
+      setError('Please upload an image or video file');
+      return;
+    }
+    
+    // Reset states
+    setError('');
+    setVideoLoaded(false);
+    setLoadingStatus('');
+    setAsciiArt('');
+    
+    // Check file size (limit to 100MB for videos)
+    if (isVideo && file.size > 100 * 1024 * 1024) {
+      setError('Video file is too large. Please use a video under 100MB.');
+      return;
+    }
+    
+    if (isVideo) {
+      setLoadingStatus('Reading video file...');
+    }
     
     const reader = new FileReader();
-    reader.onload = (e) => {
-      const img = new Image();
-      img.onload = () => {
-        setImage(img);
-        convertToAscii(img);
-      };
-      img.src = e.target.result;
+    
+    reader.onprogress = (e) => {
+      if (e.lengthComputable && isVideo) {
+        const percentLoaded = Math.round((e.loaded / e.total) * 100);
+        setLoadingStatus(`Reading video file... ${percentLoaded}%`);
+      }
     };
+    
+    reader.onerror = () => {
+      setError('Failed to read file. Please try again.');
+      setLoadingStatus('');
+    };
+    
+    reader.onload = (e) => {
+      if (isVideo) {
+        setLoadingStatus('Loading video...');
+        setVideo(e.target.result);
+        setImage(null);
+      } else if (isImage) {
+        const img = new Image();
+        img.onload = () => {
+          setImage(img);
+          setVideo(null);
+          convertToAscii(img);
+        };
+        img.onerror = () => {
+          setError('Failed to load image. Please try a different file.');
+        };
+        img.src = e.target.result;
+      }
+    };
+    
     reader.readAsDataURL(file);
   }, []);
 
@@ -50,8 +115,13 @@ const Scii = () => {
     
     setIsProcessing(true);
     
-    setTimeout(() => {
+    requestAnimationFrame(() => {
       const canvas = canvasRef.current;
+      if (!canvas) {
+        setIsProcessing(false);
+        return;
+      }
+      
       const ctx = canvas.getContext('2d');
       
       canvas.width = params.width;
@@ -94,8 +164,212 @@ const Scii = () => {
       
       setAsciiArt(ascii);
       setIsProcessing(false);
-    }, 10);
+    });
   }, [params]);
+
+  const convertVideoFrameToAscii = useCallback(() => {
+    if (!videoRef.current || !canvasRef.current) return;
+    
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    
+    // Check if video has valid dimensions
+    if (video.videoWidth === 0 || video.videoHeight === 0) {
+      console.error('Video has invalid dimensions');
+      return;
+    }
+    
+    // Set canvas dimensions
+    canvas.width = params.width;
+    canvas.height = params.height;
+    
+    // Draw video frame to canvas
+    try {
+      ctx.drawImage(video, 0, 0, params.width, params.height);
+    } catch (e) {
+      console.error('Failed to draw video frame:', e);
+      return;
+    }
+    
+    // Get image data
+    const imageData = ctx.getImageData(0, 0, params.width, params.height);
+    const data = imageData.data;
+    
+    let ascii = '';
+    const chars = params.charset;
+    const charRange = chars.length - 1;
+    
+    for (let y = 0; y < params.height; y++) {
+      for (let x = 0; x < params.width; x++) {
+        const offset = (y * params.width + x) * 4;
+        
+        // Check alpha channel for transparency
+        const alpha = data[offset + 3];
+        
+        if (params.preserveTransparency && alpha < params.alphaThreshold) {
+          ascii += ' ';
+        } else {
+          let gray = (data[offset] * 0.299 + data[offset + 1] * 0.587 + data[offset + 2] * 0.114);
+          gray = Math.max(0, Math.min(255, (gray + params.brightness) * params.contrast));
+          
+          if (params.invert) gray = 255 - gray;
+          
+          const charIndex = Math.floor((gray / 255) * charRange);
+          ascii += chars[params.invert ? charRange - charIndex : charIndex];
+        }
+      }
+      ascii += '\n';
+    }
+    
+    setAsciiArt(ascii);
+    
+    // Draw ASCII to canvas for recording if needed
+    if (asciiCanvasRef.current && (isRecording || isPlaying)) {
+      const asciiCanvas = asciiCanvasRef.current;
+      const asciiCtx = asciiCanvas.getContext('2d');
+      
+      const fontSize = Math.max(6, params.fontSize);
+      const lineHeight = fontSize * 0.8;
+      const charWidth = fontSize * 0.6;
+      
+      asciiCanvas.width = params.width * charWidth;
+      asciiCanvas.height = params.height * lineHeight;
+      
+      asciiCtx.fillStyle = '#000000';
+      asciiCtx.fillRect(0, 0, asciiCanvas.width, asciiCanvas.height);
+      
+      asciiCtx.fillStyle = '#ffffff';
+      asciiCtx.font = `${fontSize}px monospace`;
+      asciiCtx.textBaseline = 'top';
+      
+      const lines = ascii.split('\n');
+      lines.forEach((line, i) => {
+        asciiCtx.fillText(line, 0, i * lineHeight);
+      });
+    }
+    
+    if (isPlaying && !video.paused) {
+      animationRef.current = requestAnimationFrame(convertVideoFrameToAscii);
+    }
+  }, [params, isPlaying, isRecording]);
+
+  const handleVideoCanPlay = useCallback(() => {
+    setLoadingStatus('Video ready, generating preview...');
+    setVideoLoaded(true);
+    setIsProcessing(true);
+    
+    // Ensure video is seekable and at the beginning
+    if (videoRef.current) {
+      videoRef.current.currentTime = 0;
+    }
+    
+    // Small delay to ensure video frame is ready
+    setTimeout(() => {
+      convertVideoFrameToAscii();
+      setIsProcessing(false);
+      setLoadingStatus('');
+    }, 100);
+  }, [convertVideoFrameToAscii]);
+
+  const handleVideoError = useCallback((e) => {
+    console.error('Video error:', e);
+    setError('Failed to load video. The format may not be supported by your browser.');
+    setLoadingStatus('');
+    setVideoLoaded(false);
+  }, []);
+
+  const handleVideoLoadStart = useCallback(() => {
+    setLoadingStatus('Initializing video...');
+  }, []);
+
+  const handleVideoProgress = useCallback(() => {
+    if (videoRef.current) {
+      const video = videoRef.current;
+      if (video.buffered.length > 0) {
+        const bufferedEnd = video.buffered.end(video.buffered.length - 1);
+        const duration = video.duration;
+        if (duration > 0) {
+          const bufferedPercent = Math.round((bufferedEnd / duration) * 100);
+          setLoadingStatus(`Buffering video... ${bufferedPercent}%`);
+        }
+      }
+    }
+  }, []);
+
+  const handleVideoPlay = () => {
+    if (!videoLoaded) {
+      setError('Please wait for the video to load');
+      return;
+    }
+    
+    setIsPlaying(true);
+    if (videoRef.current) {
+      videoRef.current.play().catch((e) => {
+        console.error('Failed to play video:', e);
+        setError('Failed to play video');
+        setIsPlaying(false);
+      });
+      convertVideoFrameToAscii();
+    }
+  };
+
+  const handleVideoPause = () => {
+    setIsPlaying(false);
+    if (videoRef.current) {
+      videoRef.current.pause();
+    }
+    if (animationRef.current) {
+      cancelAnimationFrame(animationRef.current);
+    }
+  };
+
+  const startRecording = () => {
+    if (!asciiCanvasRef.current || !videoLoaded) {
+      setError('Please wait for the video to load before recording');
+      return;
+    }
+    
+    const stream = asciiCanvasRef.current.captureStream(params.fps);
+    const mediaRecorder = new MediaRecorder(stream, {
+      mimeType: 'video/webm;codecs=vp9'
+    });
+    
+    mediaRecorderRef.current = mediaRecorder;
+    setRecordedChunks([]);
+    
+    mediaRecorder.ondataavailable = (event) => {
+      if (event.data.size > 0) {
+        setRecordedChunks(prev => [...prev, event.data]);
+      }
+    };
+    
+    mediaRecorder.start();
+    setIsRecording(true);
+    handleVideoPlay();
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current) {
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
+      handleVideoPause();
+    }
+  };
+
+  const downloadRecording = () => {
+    if (recordedChunks.length === 0) return;
+    
+    const blob = new Blob(recordedChunks, { type: 'video/webm' });
+    downloadFile(blob, 'scii-ascii-video.webm');
+  };
+
+  // Re-convert video frame when parameters change
+  useEffect(() => {
+    if (video && videoLoaded && !isPlaying) {
+      convertVideoFrameToAscii();
+    }
+  }, [params, video, videoLoaded, isPlaying, convertVideoFrameToAscii]);
 
   useEffect(() => {
     if (image) {
@@ -106,16 +380,26 @@ const Scii = () => {
   const handleDrop = useCallback((e) => {
     e.preventDefault();
     const file = e.dataTransfer.files[0];
-    handleImageUpload(file);
-  }, [handleImageUpload]);
+    handleFileUpload(file);
+  }, [handleFileUpload]);
 
   const handleDragOver = useCallback((e) => {
     e.preventDefault();
   }, []);
 
-  const removeImage = () => {
+  const removeMedia = () => {
     setImage(null);
+    setVideo(null);
     setAsciiArt('');
+    setIsPlaying(false);
+    setIsRecording(false);
+    setRecordedChunks([]);
+    setVideoLoaded(false);
+    setLoadingStatus('');
+    setError('');
+    if (animationRef.current) {
+      cancelAnimationFrame(animationRef.current);
+    }
   };
 
   const downloadFile = (blob, filename) => {
@@ -239,7 +523,7 @@ const Scii = () => {
         <div className="space-y-6">
           {/* Main Preview Area - Always visible */}
           <div className="rounded-xl p-6 border bg-stone-950 border-stone-800">
-            {!image ? (
+            {!image && !video ? (
               // Upload State
               <>
                 <div className="mb-4">
@@ -252,16 +536,23 @@ const Scii = () => {
                   onClick={() => fileInputRef.current?.click()}
                 >
                   <Upload className="w-12 h-12 text-stone-500 mx-auto mb-3" />
-                  <p className="text-white text-sm mb-1">Drop image here</p>
+                  <p className="text-white text-sm mb-1">Drop image or video here</p>
                   <p className="text-xs text-stone-400">or click to browse</p>
+                  <p className="text-xs text-stone-500 mt-2">Supported: JPG, PNG, GIF, MP4, WebM, MOV (max 100MB)</p>
                   <input
                     ref={fileInputRef}
                     type="file"
-                    accept="image/*"
+                    accept="image/*,video/*"
                     className="hidden"
-                    onChange={(e) => handleImageUpload(e.target.files[0])}
+                    onChange={(e) => handleFileUpload(e.target.files[0])}
                   />
                 </div>
+                {error && (
+                  <div className="mt-4 p-3 bg-red-900/20 border border-red-800 rounded-lg flex items-center space-x-2">
+                    <AlertCircle className="w-4 h-4 text-red-400 flex-shrink-0" />
+                    <p className="text-sm text-red-400">{error}</p>
+                  </div>
+                )}
               </>
             ) : (
               // Preview State
@@ -269,35 +560,108 @@ const Scii = () => {
                 <div className="flex items-center justify-between mb-4">
                   <div className="flex items-center space-x-2">
                     <Type className="w-5 h-5 text-white" />
-                    <h2 className="text-lg font-medium">Preview</h2>
+                    <h2 className="text-lg font-medium">{video ? 'Video Preview' : 'Image Preview'}</h2>
                     {isProcessing && (
                       <div className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full" />
                     )}
                   </div>
                   <button
-                    onClick={removeImage}
+                    onClick={removeMedia}
                     className="p-2 bg-stone-900 hover:bg-stone-800 rounded-lg transition-colors"
                   >
                     <X className="w-4 h-4 text-white" />
                   </button>
                 </div>
+
+                {/* Error display */}
+                {error && (
+                  <div className="mb-4 p-3 bg-red-900/20 border border-red-800 rounded-lg flex items-center space-x-2">
+                    <AlertCircle className="w-4 h-4 text-red-400 flex-shrink-0" />
+                    <p className="text-sm text-red-400">{error}</p>
+                  </div>
+                )}
+
+                {/* Loading status */}
+                {loadingStatus && (
+                  <div className="mb-4 p-3 bg-stone-800 rounded-lg">
+                    <p className="text-sm text-stone-300">{loadingStatus}</p>
+                  </div>
+                )}
+
+                {video && (
+                  // Video Controls
+                  <div className="mb-4 flex items-center justify-center space-x-4">
+                    <button
+                      onClick={isPlaying ? handleVideoPause : handleVideoPlay}
+                      disabled={!videoLoaded}
+                      className={`px-4 py-2 rounded-lg transition-opacity ${
+                        videoLoaded 
+                          ? 'bg-white text-black hover:opacity-90' 
+                          : 'bg-stone-700 text-stone-400 cursor-not-allowed'
+                      }`}
+                    >
+                      {isPlaying ? 'Pause' : 'Play'}
+                    </button>
+                    <button
+                      onClick={isRecording ? stopRecording : startRecording}
+                      disabled={!videoLoaded}
+                      className={`px-4 py-2 rounded-lg transition-colors ${
+                        !videoLoaded 
+                          ? 'bg-stone-800 text-stone-500 cursor-not-allowed'
+                          : isRecording 
+                          ? 'bg-red-600 hover:bg-red-700 text-white' 
+                          : 'bg-stone-700 hover:bg-stone-600 text-white'
+                      }`}
+                    >
+                      {isRecording ? 'Stop Recording' : 'Record ASCII'}
+                    </button>
+                    {recordedChunks.length > 0 && (
+                      <button
+                        onClick={downloadRecording}
+                        className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg transition-colors"
+                      >
+                        Download Video
+                      </button>
+                    )}
+                  </div>
+                )}
+
                 <div className="bg-black rounded-lg p-6 overflow-auto max-h-[70vh] border border-stone-800 flex justify-center">
+                  {video && (
+                    <video
+                      ref={videoRef}
+                      src={video}
+                      style={{ display: 'none' }}
+                      loop
+                      muted
+                      playsInline
+                      crossOrigin="anonymous"
+                      onCanPlay={handleVideoCanPlay}
+                      onError={handleVideoError}
+                      onLoadStart={handleVideoLoadStart}
+                      onProgress={handleVideoProgress}
+                    />
+                  )}
                   <pre
                     ref={asciiRef}
                     className="text-white whitespace-pre font-mono leading-none"
                     style={{
-                      fontSize: `${params.fontSize}px`
+                      fontSize: `${params.fontSize}px`,
+                      minHeight: video && !asciiArt ? '200px' : 'auto',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center'
                     }}
                   >
-                    {asciiArt}
+                    {asciiArt || (video && !videoLoaded && !error ? 'Preparing video...' : '')}
                   </pre>
                 </div>
               </>
             )}
           </div>
 
-          {/* Settings - Only show when image is loaded */}
-          {image && (
+          {/* Settings - Only show when image or video is loaded */}
+          {(image || video) && (
             <div className="rounded-xl border bg-stone-950 border-stone-800">
               <div 
                 className="flex items-center justify-between p-4 cursor-pointer"
@@ -316,7 +680,7 @@ const Scii = () => {
 
               {settingsExpanded && (
                 <div className="px-4 pb-4">
-                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                  <div className={`grid grid-cols-1 ${video ? 'lg:grid-cols-4' : 'lg:grid-cols-3'} gap-6`}>
                     {/* Size Section */}
                     <div>
                       <div className="flex items-center space-x-2 mb-3">
@@ -354,6 +718,63 @@ const Scii = () => {
                         </div>
                       </div>
                     </div>
+
+                    {/* Video Section - Only show for videos */}
+                    {video && (
+                      <div>
+                        <div className="flex items-center space-x-2 mb-3">
+                          <Film className="w-4 h-4 text-stone-400" />
+                          <h3 className="text-sm font-medium text-stone-300">Video</h3>
+                        </div>
+                        <div className="space-y-4">
+                          <div className="p-3 rounded-lg bg-stone-900">
+                            <div className="flex justify-between items-center mb-2">
+                              <label className="text-sm text-white">Frame Rate</label>
+                              <span className="text-xs px-2 py-1 rounded bg-stone-700 text-white">{params.fps}</span>
+                            </div>
+                            <input
+                              type="range"
+                              min="15"
+                              max="60"
+                              step="15"
+                              value={params.fps}
+                              onChange={(e) => setParams(p => ({ ...p, fps: parseInt(e.target.value) }))}
+                              className="w-full h-1 bg-stone-700 rounded-lg appearance-none cursor-pointer slider"
+                            />
+                          </div>
+                          <div className="p-3 rounded-lg bg-stone-900">
+                            <div className="flex justify-between items-center mb-2">
+                              <label className="text-sm text-white">Video Width</label>
+                              <span className="text-xs px-2 py-1 rounded bg-stone-700 text-white">{params.videoWidth}</span>
+                            </div>
+                            <input
+                              type="range"
+                              min="240"
+                              max="1920"
+                              step="80"
+                              value={params.videoWidth}
+                              onChange={(e) => setParams(p => ({ ...p, videoWidth: parseInt(e.target.value) }))}
+                              className="w-full h-1 bg-stone-700 rounded-lg appearance-none cursor-pointer slider"
+                            />
+                          </div>
+                          <div className="p-3 rounded-lg bg-stone-900">
+                            <div className="flex justify-between items-center mb-2">
+                              <label className="text-sm text-white">Video Height</label>
+                              <span className="text-xs px-2 py-1 rounded bg-stone-700 text-white">{params.videoHeight}</span>
+                            </div>
+                            <input
+                              type="range"
+                              min="180"
+                              max="1080"
+                              step="60"
+                              value={params.videoHeight}
+                              onChange={(e) => setParams(p => ({ ...p, videoHeight: parseInt(e.target.value) }))}
+                              className="w-full h-1 bg-stone-700 rounded-lg appearance-none cursor-pointer slider"
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    )}
 
                     {/* Appearance Section */}
                     <div>
@@ -506,8 +927,9 @@ const Scii = () => {
         </div>
       </div>
 
-      {/* Hidden canvas for processing */}
+      {/* Hidden canvases for processing */}
       <canvas ref={canvasRef} className="hidden" />
+      <canvas ref={asciiCanvasRef} className="hidden" />
 
       <style jsx>{`
         .slider::-webkit-slider-thumb {
